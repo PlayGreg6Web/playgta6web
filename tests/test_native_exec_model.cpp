@@ -1363,11 +1363,15 @@ void test_error_scope_model() {
     CHECK(std::string(error_scope_phase(static_cast<uint16_t>(GpuOpcode::Draw))) == "pass");
     CHECK(std::string(error_scope_phase(static_cast<uint16_t>(GpuOpcode::Present))) == "present_submit");
     CHECK(std::string(error_scope_phase(static_cast<uint16_t>(GpuOpcode::WriteBuffer))) == "other");
-    // off until a device error arms it; explicit stays on; auto disarms after the error budget
-    CHECK(!error_scope_active(false, 0, 0));
-    CHECK(error_scope_active(false, 1, 0));
-    CHECK(!error_scope_active(false, 5, kErrorScopeAutoErrors));
-    CHECK(error_scope_active(true, 0, kErrorScopeAutoErrors + 10));
+    // off until an unattributed device error arms it; armed for a window of presents after the latest one;
+    // explicit stays on; auto disarms after the error budget
+    CHECK(!error_scope_active(false, 0, 0, 0, 0));
+    CHECK(!error_scope_active(false, 0, 0, 5, 0));
+    CHECK(error_scope_active(false, 1, 10, 10, 0));
+    CHECK(error_scope_active(false, 1, 10, 10 + kErrorScopeAutoPresents, 0));
+    CHECK(!error_scope_active(false, 1, 10, 11 + kErrorScopeAutoPresents, 0));
+    CHECK(!error_scope_active(false, 5, 10, 10, kErrorScopeAutoErrors));
+    CHECK(error_scope_active(true, 0, 0, 1000, kErrorScopeAutoErrors + 10));
     // dedupe by (message, phase, context); bounded entries, counts by message
     ErrorScopeLog log;
     log.record("validation", "bad \"thing\"", "pipeline_create", "rp1(vs=a fs=b)", 3, 10, 24);

@@ -19,6 +19,7 @@ namespace playgta6::gpu::native_exec {
 inline constexpr size_t kErrorScopeMaxEntries = 64;     // distinct (phase, message, context) rows kept
 inline constexpr size_t kErrorScopeMaxMessages = 128;   // distinct messages counted
 inline constexpr uint64_t kErrorScopeAutoErrors = 200;  // auto mode stops after this many scoped errors
+inline constexpr uint64_t kErrorScopeAutoPresents = 120;  // auto mode stays armed this long after an error
 
 // The phase an opcode belongs to: where the error was raised.
 inline const char* error_scope_phase(uint16_t opcode) {
@@ -54,11 +55,16 @@ inline const char* error_scope_phase(uint16_t opcode) {
     }
 }
 
-// Scoping is explicit (--gpu-error-scopes), or armed automatically once a device error has been seen and
-// disarmed again after kErrorScopeAutoErrors scoped errors, so a healthy run pays nothing.
-inline bool error_scope_active(bool explicit_on, uint64_t device_errors, uint64_t scoped_errors) {
+// Scoping is explicit (--gpu-error-scopes), or armed automatically by a device error nothing attributed yet
+// (an uncaptured one on the executor thread, or a scoped one) and kept armed for kErrorScopeAutoPresents
+// presents after the latest such error, disarmed for good after kErrorScopeAutoErrors scoped errors. Errors
+// an object creation already caught in its own scope (created_valid: counted with their opcode) and shader
+// worker errors (scopes are per thread) do not arm it, so a run with only those pays nothing per packet.
+inline bool error_scope_active(bool explicit_on, uint64_t unattributed_errors, uint64_t last_error_present,
+                               uint64_t present, uint64_t scoped_errors) {
     if (explicit_on) return true;
-    return device_errors > 0 && scoped_errors < kErrorScopeAutoErrors;
+    return unattributed_errors > 0 && present <= last_error_present + kErrorScopeAutoPresents &&
+           scoped_errors < kErrorScopeAutoErrors;
 }
 
 struct ErrorScopeEntry {
