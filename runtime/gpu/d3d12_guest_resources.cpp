@@ -3361,8 +3361,6 @@ bool Device::relocate_storage_buffer(uint64_t va, uint64_t size, uint32_t* buffe
     // is recent.
     constexpr size_t kHardMaxEntries = kStorageRelocationHardEntries;
     constexpr uint64_t kHardMaxBytes = kStorageRelocationHardBytes;
-    // Settled homes looked at for reuse, oldest first, before the least recently used one is dropped.
-    constexpr size_t kReuseScan = 1024;
 
     if (va == 0 || size == 0 || size > kMaxBytes || buffer_id == nullptr || offset == nullptr) {
         return false;
@@ -3433,7 +3431,7 @@ bool Device::relocate_storage_buffer(uint64_t va, uint64_t size, uint32_t* buffe
     std::vector<uint32_t> emptied_chunks;  // shared chunks that lost a home in this call (#2093)
     CommandEncoder released;               // their destroys
     const auto erase_entry = [&](std::map<RelocatedStorageKey, RelocatedStorage>::iterator it) {
-        storage_relocation_lru_.erase(it->second.lru_pos);
+        storage_relocation_lru_.erase(&it->second.lru_node);
         storage_relocation_bytes_ -= std::min(storage_relocation_bytes_, it->second.slot_capacity);
         if (!it->second.dedicated) {
             const uint32_t chunk = it->second.buffer_id;
@@ -3455,27 +3453,21 @@ bool Device::relocate_storage_buffer(uint64_t va, uint64_t size, uint32_t* buffe
     };
     if (storage_relocations_.size() >= kMaxEntries || over_hard_bound()) {
         const bool forced = over_hard_bound();
-        const auto settled = [&](const StorageLruNode& n) {
+        const auto settled = [&](const StorageLru::Node& n) {
             return forced || present >= n.last_used_present + kReuseAfterPresents;
         };
-        const auto entry_of = [&](const StorageLruNode& n) {
+        const auto entry_of = [&](const StorageLru::Node& n) {
             return storage_relocations_.find(RelocatedStorageKey{n.entry->va, n.entry->size, n.entry->dedicated});
         };
-        // Oldest first (last_used_present grows along the LRU order, so the settled homes lead): the
-        // first settled home large enough is handed to the new range. The scan reads only the nodes.
+        // Oldest first, up to the first home still in use or kStorageReuseScan homes: the first settled
+        // home large enough is handed to the new range (indexed, gpu/storage_reuse_lru.h).
         auto reuse_it = storage_relocations_.end();
-        size_t scanned = 0;
-        for (auto l = storage_relocation_lru_.begin(); l != storage_relocation_lru_.end() && scanned < kReuseScan;
-             ++l, ++scanned) {
-            if (!settled(*l)) {
-                break;
-            }
-            if (l->dedicated == dedicated && l->slot_capacity >= need) {
-                reuse_it = entry_of(*l);
-                break;
-            }
+        size_t looked = 0;
+        if (const StorageLru::Node* n =
+                storage_relocation_lru_.find_reuse(present, forced, need, dedicated, kReuseAfterPresents, &looked)) {
+            reuse_it = entry_of(*n);
         }
-        count_work(Work::StorageReuseScanSteps, scanned);
+        count_work(Work::StorageReuseScanSteps, looked);
         bool dropped = false;
         if (reuse_it != storage_relocations_.end()) {
             target_buf = reuse_it->second.buffer_id;
@@ -3488,7 +3480,7 @@ bool Device::relocate_storage_buffer(uint64_t va, uint64_t size, uint32_t* buffe
         // bound one settled home goes. A home a recent submission may still bind is kept otherwise
         // (grow instead of evicting).
         while (!storage_relocation_lru_.empty()) {
-            const StorageLruNode& front = storage_relocation_lru_.front();
+            const StorageLru::Node& front = *storage_relocation_lru_.front();
             if (!over_hard_bound() && (dropped || !settled(front))) {
                 break;
             }
@@ -3568,8 +3560,7 @@ bool Device::relocate_storage_buffer(uint64_t va, uint64_t size, uint32_t* buffe
     const auto placed = storage_relocations_.emplace(key, entry).first;
     storage_home_index_[storage_home_key(target_buf, target_off)] = placed;
     storage_unprimed_.insert(&placed->second);  // new: compared at the next flush
-    placed->second.lru_pos = storage_relocation_lru_.insert(
-        storage_relocation_lru_.end(), StorageLruNode{&placed->second, present, target_cap, dedicated});
+    storage_relocation_lru_.push_back(&placed->second.lru_node, &placed->second, present, target_cap, dedicated);
     storage_relocation_bytes_ += target_cap;
     if (!dedicated) {
         ++storage_relocation_chunk_live_[target_buf];
@@ -3673,8 +3664,7 @@ bool Device::storage_homes_unmoved(const std::pair<uint32_t, uint64_t>* homes, s
 }
 
 void Device::touch_storage_lru(RelocatedStorage& r, uint64_t present) {
-    storage_relocation_lru_.splice(storage_relocation_lru_.end(), storage_relocation_lru_, r.lru_pos);
-    r.lru_pos->last_used_present = present;
+    storage_relocation_lru_.touch(&r.lru_node, present);
 }
 
 bool Device::relocate_ia_buffer(uint64_t va, uint64_t size, uint32_t* buffer_id, uint64_t* offset) {
