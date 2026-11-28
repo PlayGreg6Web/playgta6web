@@ -51,6 +51,8 @@ const char* work_name(Work w) {
     case Work::TextureSyncViewSkips: return "texture_sync_view_skips";
     case Work::TextureSyncViewTracked: return "texture_sync_view_tracked";
     case Work::TextureSyncUntracked: return "texture_sync_untracked";
+    case Work::TextureSyncOwnedChecks: return "texture_sync_owned_checks";
+    case Work::TextureSyncOwnedHashSkips: return "texture_sync_owned_hash_skips";
     case Work::BufferUploads: return "buffer_uploads";
     case Work::CopiesSkipped: return "copies_skipped";
     case Work::CopySkipGateOff: return "copy_skip_gate_off";

@@ -7255,6 +7255,23 @@ void test_window_texture_sync_markpass_and_inplace_hash() {
             CHECK(wt.origin_y == 64 && wt.height == 64 && wt.bytes_per_row == kW);
         }
 
+        // Compute read-back ownership on write-tracked memory: repeat binds of our own re-tile's bytes
+        // upload nothing (after the first, without a surface hash); a guest write after them is uploaded.
+        dev->note_texture_readback_pending(tex_id);
+        std::fill(pixels.begin(), pixels.end(), uint8_t{0x5Cu});
+        CHECK(com::write_guest(arena_mem, pixels.data(), pixels.size()));
+        dev->note_texture_readback_retiled(tex_id, arena_mem, pixels.size());
+        for (int i = 0; i < 3; ++i) {
+            gpu::CommandEncoder e;
+            CHECK(!dev->sync_bound_texture_memory(tex_id, e));
+            CHECK(write_texture_packets(e, tex_id).empty());
+        }
+        const uint8_t guest_byte = 0x11u;
+        CHECK(com::write_guest(arena_mem + size_t{100} * kW, &guest_byte, 1));
+        gpu::CommandEncoder e4;
+        CHECK(dev->sync_bound_texture_memory(tex_id, e4));
+        CHECK(!write_texture_packets(e4, tex_id).empty());
+
         fx.vcall(tex_obj, Slot::Release);
         scene.release_all();
     }

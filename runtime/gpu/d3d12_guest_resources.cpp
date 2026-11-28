@@ -1037,6 +1037,13 @@ void Device::note_texture_readback_retiled(uint32_t resource_id, uint64_t cpu_va
     if (resource_id == 0 || host == nullptr) {
         return;
     }
+    // The take goes first (it also consumes the re-tile's own writes), so a guest write racing the
+    // hash is reported by the next bind's take.
+    os::WriteCursor cursor{};
+    cursor.peek_watch = true;
+    thread_local std::vector<uint64_t> pages;
+    pages.clear();
+    const bool primed = os::take_written_pages(host, bytes, &cursor, &pages);
     const uint64_t hash = content_hash(host, bytes);
     std::lock_guard<std::mutex> lock(tracked_textures_mutex_);
     ReadbackOwned& o = readback_owned_[resource_id];
@@ -1044,6 +1051,8 @@ void Device::note_texture_readback_retiled(uint32_t resource_id, uint64_t cpu_va
     o.va = cpu_va;
     o.bytes = bytes;
     o.hash = hash;
+    o.cursor = cursor;
+    o.cursor_primed = primed;
 }
 
 void Device::note_texture_copy_destination(uint32_t resource_id) {
@@ -1117,9 +1126,31 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
             if (!owned.valid) {
                 return false;  // the first read-back is still in flight
             }
+            count_work(Work::TextureSyncOwnedChecks);
             const void* host = com::guest_to_host(owned.va, owned.bytes);
-            if (host != nullptr && content_hash(host, owned.bytes) == owned.hash) {
-                return false;  // still the bytes our own re-tile wrote: the GPU copy is current
+            if (host != nullptr) {
+                // No page written since the last take before a matching hash: still the same bytes, no
+                // hash. Otherwise hash; on a match the cursor of this take (made before the hash) is kept.
+                os::WriteCursor cursor = owned.cursor;
+                cursor.peek_watch = true;
+                thread_local std::vector<uint64_t> owned_pages;
+                owned_pages.clear();
+                const bool tracked = os::take_written_pages(host, owned.bytes, &cursor, &owned_pages);
+                const bool unwritten = tracked && owned.cursor_primed && owned_pages.empty();
+                if (unwritten || content_hash(host, owned.bytes) == owned.hash) {
+                    if (unwritten) {
+                        count_work(Work::TextureSyncOwnedHashSkips);
+                    }
+                    std::lock_guard<std::mutex> lock(tracked_textures_mutex_);
+                    const auto ro = readback_owned_.find(resource_id);
+                    // Only onto the same re-tile's entry (an older cursor would only report more).
+                    if (ro != readback_owned_.end() && ro->second.valid && ro->second.hash == owned.hash &&
+                        ro->second.va == owned.va && ro->second.bytes == owned.bytes) {
+                        ro->second.cursor = cursor;
+                        ro->second.cursor_primed = tracked;
+                    }
+                    return false;  // still the bytes our own re-tile wrote: the GPU copy is current
+                }
             }
             // A genuine guest write since the re-tile: the guest owns the texels again.
             std::lock_guard<std::mutex> lock(tracked_textures_mutex_);
