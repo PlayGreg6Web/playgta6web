@@ -533,6 +533,7 @@ struct ExecutorStats {
     uint64_t invalid_bind_group_layouts = 0;   // created with an error (or over a per-stage limit)
     uint64_t invalid_pipeline_layouts = 0;     // a group's layout is invalid: never created
     uint64_t invalid_bind_groups = 0;          // created with an error (an invalid view, a usage mismatch, ...)
+    uint64_t scope_pop_waits = 0;              // created_valid pops that were not complete at once (WaitAny)
     uint64_t invalid_pipelines = 0;            // sync creation error, or an invalid explicit layout: never handed to a pass
     uint64_t skip_invalid_bind_group = 0;      // draws / dispatches skipped: a bound group is invalid
     uint64_t skip_invalid_bind_group_sets = 0; // SetBindGroup of an invalid group: not encoded

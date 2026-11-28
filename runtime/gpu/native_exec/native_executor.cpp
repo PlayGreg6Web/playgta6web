@@ -3553,22 +3553,29 @@ struct NativeExecutor::Impl {
     // Runs `create` (a Dawn object creation) inside a validation error scope: false when Dawn rejected it.
     // The error is still counted as the uncaptured callback would (device_errors, its kind), so a tracked
     // invalid object is never hidden from the report; the caller marks the object invalid.
+    // Dawn's error scopes are synchronous: the pop's callback runs inside PopErrorScope (AllowSpontaneous), so
+    // no WaitAny round trip per created object; WaitAny only when it did not.
     template <class F>
     bool created_valid(F&& create) {
         device.PushErrorScope(wgpu::ErrorFilter::Validation);
         create();
         struct ScopeResult {
+            bool done = false;
             bool error = false;
             std::string message;
         } sr;
-        instance.WaitAny(device.PopErrorScope(
-                             wgpu::CallbackMode::WaitAnyOnly,
-                             [](wgpu::PopErrorScopeStatus, wgpu::ErrorType type, wgpu::StringView msg, ScopeResult* out) {
-                                 out->error = type != wgpu::ErrorType::NoError && type != wgpu::ErrorType::Unknown;
-                                 if (out->error) out->message = to_string(msg);
-                             },
-                             &sr),
-                         kWaitForever);
+        const wgpu::Future fut = device.PopErrorScope(
+            wgpu::CallbackMode::AllowSpontaneous,
+            [](wgpu::PopErrorScopeStatus, wgpu::ErrorType type, wgpu::StringView msg, ScopeResult* out) {
+                out->error = type != wgpu::ErrorType::NoError && type != wgpu::ErrorType::Unknown;
+                if (out->error) out->message = to_string(msg);
+                out->done = true;
+            },
+            &sr);
+        if (!sr.done) {
+            ++stats.scope_pop_waits;
+            instance.WaitAny(fut, kWaitForever);
+        }
         if (!sr.error) return true;
         ++stats.device_errors;
         stats.last_device_error = sr.message;
@@ -7153,11 +7160,16 @@ struct NativeExecutor::Impl {
             bool tex_writable = false;                   // a real texture view bound to a writable storage-texture entry
             int dyn_rank = -1;
         };
+        // Sized up front: no reallocation (and no copy of the entries' Dawn handles) while they are filled.
         std::vector<Pending> entries;
-        std::vector<uint32_t> seen;
+        entries.reserve(h.entry_count);
         auto desc = std::make_shared<BgDesc>();
+        desc->model.reserve(h.entry_count);
+        desc->handles.reserve(h.entry_count);
         BgUses uses;
+        uses.uses.reserve(h.entry_count);
         std::vector<BgSnapSrc> use_src;
+        use_src.reserve(h.entry_count);
         // dynamicOffsetIndicesForLayoutEntries: the rank of a dynamic-offset buffer binding
         std::vector<uint32_t> dyn_bindings;
         for (const LayoutEntry& x : rec.entries)
@@ -7165,9 +7177,8 @@ struct NativeExecutor::Impl {
         std::sort(dyn_bindings.begin(), dyn_bindings.end());
         for (uint32_t i = 0; i < h.entry_count; ++i) {
             const auto e = read_payload<GpuBindGroupEntry2>(p, 16 + size_t{i} * 48);
-            if (std::find(seen.begin(), seen.end(), e.binding) != seen.end())
-                return fail("bind group: duplicate binding " + std::to_string(e.binding));
-            seen.push_back(e.binding);
+            for (const Pending& prev : entries)
+                if (prev.binding == e.binding) return fail("bind group: duplicate binding " + std::to_string(e.binding));
             const LayoutEntry* le = nullptr;
             for (const LayoutEntry& x : rec.entries)
                 if (x.binding == e.binding) { le = &x; break; }
@@ -11913,6 +11924,7 @@ std::string NativeExecutor::stats_json() const {
     num("invalid_bind_group_layouts", st.invalid_bind_group_layouts);
     num("invalid_pipeline_layouts", st.invalid_pipeline_layouts);
     num("invalid_bind_groups", st.invalid_bind_groups);
+    num("scope_pop_waits", st.scope_pop_waits);
     num("invalid_pipelines", st.invalid_pipelines);
     num("skip_invalid_bind_group", st.skip_invalid_bind_group);
     num("skip_invalid_bind_group_sets", st.skip_invalid_bind_group_sets);
