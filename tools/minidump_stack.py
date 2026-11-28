@@ -123,6 +123,8 @@ def resolve_dump(arg):
 def find_cdb(explicit):
     if explicit:
         return explicit
+    if os.environ.get("PG6_MINIDUMP_NO_CDB"):  # tests pin the built-in parser's output format
+        return None
     found = shutil.which("cdb.exe")
     if found:
         return found
