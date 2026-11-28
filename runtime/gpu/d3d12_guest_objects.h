@@ -63,6 +63,7 @@
 #include <cstring>
 #include <deque>
 #include <functional>
+#include <list>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -1290,13 +1291,15 @@ private:
     mutable std::once_flag mesh_possible_once_;
     mutable bool mesh_possible_ = false;
     std::unique_ptr<PipelineDump> dump_;
+    // (va, size, home bytes)
+    using RelocatedUniformKey = std::tuple<uint64_t, uint64_t, uint64_t>;
     struct RelocatedUniform {
         uint64_t va = 0;
         uint64_t size = 0;  // guest bytes copied; the home is align_up(max(size, binding), 256), zero past them
         uint32_t buffer_id = 0;
         uint64_t offset = 0;
         std::vector<uint8_t> shadow;  // bytes last written (empty: never written)
-        uint64_t last_used_seq = 0;
+        std::list<RelocatedUniformKey>::iterator lru_pos;  // this entry's place in relocation_lru_
         // #1963 page index (under relocation_mutex_): primed = compared after a successful flush
         // take covering its host range, so only compared again when a take reports it written.
         bool primed = false;
@@ -1306,9 +1309,10 @@ private:
     // O36: homes of evicted entries, reused by the next entry of the same (size, home bytes) so the
     // zero tail past `size` stays zero. Bounds relocations_ and the chunks behind it.
     std::map<std::pair<uint64_t, uint64_t>, std::vector<std::pair<uint32_t, uint64_t>>> relocation_free_;
-    uint64_t relocation_seq_ = 0;
-    // (va, size, home bytes)
-    std::map<std::tuple<uint64_t, uint64_t, uint64_t>, RelocatedUniform> relocations_;
+    std::map<RelocatedUniformKey, RelocatedUniform> relocations_;
+    // relocations_ keys, least recently bound first (under relocation_mutex_): a bind moves its key to
+    // the back, so the entry evicted at the cap is the front one (O(1) instead of a scan of the map).
+    std::list<RelocatedUniformKey> relocation_lru_;
     struct RelocatedStorage {
         uint64_t va = 0;
         uint64_t size = 0;

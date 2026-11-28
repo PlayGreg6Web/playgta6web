@@ -3261,11 +3261,9 @@ bool Device::relocate_uniform(uint64_t va, uint64_t size, uint64_t binding_size,
     auto it = relocations_.find({va, size, need});
     if (it == relocations_.end()) {
         constexpr size_t kMaxEntries = 8192;  // O36: per-draw VAs (ring-allocated constants) must not grow this forever
-        if (relocations_.size() >= kMaxEntries) {
-            auto lru = relocations_.begin();
-            for (auto i = relocations_.begin(); i != relocations_.end(); ++i) {
-                if (i->second.last_used_seq < lru->second.last_used_seq) lru = i;
-            }
+        if (relocations_.size() >= kMaxEntries && !relocation_lru_.empty()) {
+            const auto lru = relocations_.find(relocation_lru_.front());
+            relocation_lru_.pop_front();
             relocation_free_[{lru->second.size, std::get<2>(lru->first)}].emplace_back(lru->second.buffer_id,
                                                                                          lru->second.offset);
             uniform_page_index_.remove(&lru->second);
@@ -3297,9 +3295,11 @@ bool Device::relocate_uniform(uint64_t va, uint64_t size, uint64_t binding_size,
             relocation_used_ += need;
         }
         it = relocations_.emplace(std::make_tuple(va, size, need), std::move(r)).first;
+        it->second.lru_pos = relocation_lru_.insert(relocation_lru_.end(), it->first);
         uniform_unprimed_.insert(&it->second);  // new: compared at the next flush
+    } else {
+        relocation_lru_.splice(relocation_lru_.end(), relocation_lru_, it->second.lru_pos);  // most recent
     }
-    it->second.last_used_seq = ++relocation_seq_;
     *buffer_id = it->second.buffer_id;
     *offset = it->second.offset;
     return true;
