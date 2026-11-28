@@ -3384,11 +3384,7 @@ bool Device::relocate_storage_buffer(uint64_t va, uint64_t size, uint32_t* buffe
         if (it == storage_relocations_.end()) {
             return false;
         }
-        const uint64_t hit_seq = ++storage_relocation_seq_;
-        storage_relocation_lru_.erase(it->second.last_used_seq);
-        storage_relocation_lru_.emplace(hit_seq, key);
-        it->second.last_used_present = present;
-        it->second.last_used_seq = hit_seq;
+        touch_storage_lru(it->second, present);
         *buffer_id = it->second.buffer_id;
         *offset = it->second.offset;
         return true;
@@ -3413,12 +3409,21 @@ bool Device::relocate_storage_buffer(uint64_t va, uint64_t size, uint32_t* buffe
     const uint64_t hash = content_hash(bytes.data(), bytes.size());
     const uint64_t write_len = align_up(size, 4u);
     bytes.resize(static_cast<size_t>(write_len), 0);
+    // The upload is encoded here too (home id / offset patched in once the home is chosen below), so
+    // the lock is not held over the copy of the bytes into packets.
+    CommandEncoder writes;
+    std::vector<size_t> write_packets;  // offsets of the WriteBuffer packets in `writes`
+    for (uint64_t off = 0; off < write_len; off += kMaxWriteChunk) {
+        const uint64_t n = std::min<uint64_t>(kMaxWriteChunk, write_len - off);
+        write_packets.push_back(writes.size());
+        writes.write_buffer(0, 0, bytes.data() + off, static_cast<uint32_t>(n));
+    }
 
-    std::lock_guard<std::mutex> lock(storage_relocation_mutex_);
+    std::unique_lock<std::mutex> lock(storage_relocation_mutex_);
     if (take_hit()) {
         return true;  // another thread placed the same range meanwhile
     }
-    const uint64_t seq = ++storage_relocation_seq_;
+    count_work(Work::StorageRelocationMisses);
 
     CommandEncoder enc;
     uint32_t target_buf = 0;
@@ -3426,8 +3431,9 @@ bool Device::relocate_storage_buffer(uint64_t va, uint64_t size, uint32_t* buffe
     uint64_t target_cap = 0;
 
     std::vector<uint32_t> emptied_chunks;  // shared chunks that lost a home in this call (#2093)
+    CommandEncoder released;               // their destroys
     const auto erase_entry = [&](std::map<RelocatedStorageKey, RelocatedStorage>::iterator it) {
-        storage_relocation_lru_.erase(it->second.last_used_seq);
+        storage_relocation_lru_.erase(it->second.lru_pos);
         storage_relocation_bytes_ -= std::min(storage_relocation_bytes_, it->second.slot_capacity);
         if (!it->second.dedicated) {
             const uint32_t chunk = it->second.buffer_id;
@@ -3449,24 +3455,27 @@ bool Device::relocate_storage_buffer(uint64_t va, uint64_t size, uint32_t* buffe
     };
     if (storage_relocations_.size() >= kMaxEntries || over_hard_bound()) {
         const bool forced = over_hard_bound();
-        const auto settled = [&](const RelocatedStorage& e) {
-            return forced || present >= e.last_used_present + kReuseAfterPresents;
+        const auto settled = [&](const StorageLruNode& n) {
+            return forced || present >= n.last_used_present + kReuseAfterPresents;
         };
-        // Oldest first (last_used_present grows with last_used_seq, so the settled homes lead): the
-        // first settled home large enough is handed to the new range.
+        const auto entry_of = [&](const StorageLruNode& n) {
+            return storage_relocations_.find(RelocatedStorageKey{n.entry->va, n.entry->size, n.entry->dedicated});
+        };
+        // Oldest first (last_used_present grows along the LRU order, so the settled homes lead): the
+        // first settled home large enough is handed to the new range. The scan reads only the nodes.
         auto reuse_it = storage_relocations_.end();
         size_t scanned = 0;
         for (auto l = storage_relocation_lru_.begin(); l != storage_relocation_lru_.end() && scanned < kReuseScan;
              ++l, ++scanned) {
-            const auto it = storage_relocations_.find(l->second);
-            if (it == storage_relocations_.end() || !settled(it->second)) {
+            if (!settled(*l)) {
                 break;
             }
-            if (it->second.dedicated == dedicated && it->second.slot_capacity >= need) {
-                reuse_it = it;
+            if (l->dedicated == dedicated && l->slot_capacity >= need) {
+                reuse_it = entry_of(*l);
                 break;
             }
         }
+        count_work(Work::StorageReuseScanSteps, scanned);
         bool dropped = false;
         if (reuse_it != storage_relocations_.end()) {
             target_buf = reuse_it->second.buffer_id;
@@ -3479,14 +3488,11 @@ bool Device::relocate_storage_buffer(uint64_t va, uint64_t size, uint32_t* buffe
         // bound one settled home goes. A home a recent submission may still bind is kept otherwise
         // (grow instead of evicting).
         while (!storage_relocation_lru_.empty()) {
-            const auto lru_it = storage_relocations_.find(storage_relocation_lru_.begin()->second);
-            if (lru_it == storage_relocations_.end()) {
-                storage_relocation_lru_.erase(storage_relocation_lru_.begin());
-                continue;
-            }
-            if (!over_hard_bound() && (dropped || !settled(lru_it->second))) {
+            const StorageLruNode& front = storage_relocation_lru_.front();
+            if (!over_hard_bound() && (dropped || !settled(front))) {
                 break;
             }
+            const auto lru_it = entry_of(front);
             if (!lru_it->second.dedicated) {
                 storage_relocation_free_.emplace(lru_it->second.slot_capacity,
                                                  std::make_pair(lru_it->second.buffer_id, lru_it->second.offset));
@@ -3539,16 +3545,11 @@ bool Device::relocate_storage_buffer(uint64_t va, uint64_t size, uint32_t* buffe
         }
     }
 
-    for (uint64_t off = 0; off < write_len; off += kMaxWriteChunk) {
-        const uint64_t n = std::min<uint64_t>(kMaxWriteChunk, write_len - off);
-        enc.write_buffer(target_buf, static_cast<uint32_t>(target_off + off),
-                         bytes.data() + off, static_cast<uint32_t>(n));
+    for (size_t i = 0; i < write_packets.size(); ++i) {
+        // id and dst_offset only; data_len was encoded with the bytes.
+        const GpuWriteBufferPayload head{target_buf, static_cast<uint32_t>(target_off + i * kMaxWriteChunk), 0u, 0u};
+        writes.patch(write_packets[i] + sizeof(GpuPacketHeader), &head, offsetof(GpuWriteBufferPayload, data_len));
     }
-    // Not submit(): the sink can block (live pump backpressure) and storage_relocation_mutex_ is held,
-    // which stalled every recording thread binding a storage range (refresh_memory_bind_groups too)
-    // behind the pump. The upload goes out at the start of the next submission, before any command
-    // list that binds the home (the entry below is visible only after it is queued).
-    submit_with_next(enc);
     count_work(Work::BufferUploads);
     note_upload(write_len);
 
@@ -3559,8 +3560,6 @@ bool Device::relocate_storage_buffer(uint64_t va, uint64_t size, uint32_t* buffe
     entry.offset = target_off;
     entry.slot_capacity = target_cap;
     entry.last_hash = hash;
-    entry.last_used_seq = seq;
-    entry.last_used_present = present;
     entry.ever_uploaded = true;
     entry.hash_next_flush = (flush_epoch_before & 1u) != 0 ||
                             flush_epoch_.load(std::memory_order_acquire) != flush_epoch_before;
@@ -3569,7 +3568,8 @@ bool Device::relocate_storage_buffer(uint64_t va, uint64_t size, uint32_t* buffe
     const auto placed = storage_relocations_.emplace(key, entry).first;
     storage_home_index_[storage_home_key(target_buf, target_off)] = placed;
     storage_unprimed_.insert(&placed->second);  // new: compared at the next flush
-    storage_relocation_lru_.emplace(seq, key);
+    placed->second.lru_pos = storage_relocation_lru_.insert(
+        storage_relocation_lru_.end(), StorageLruNode{&placed->second, present, target_cap, dedicated});
     storage_relocation_bytes_ += target_cap;
     if (!dedicated) {
         ++storage_relocation_chunk_live_[target_buf];
@@ -3592,14 +3592,26 @@ bool Device::relocate_storage_buffer(uint64_t va, uint64_t size, uint32_t* buffe
             storage_relocation_used_ = 0;
         }
         bridge_->unregister_resource(chunk);
-        CommandEncoder rel;
-        bridge_->advance_present_frame(presents(), rel);
-        bridge_->destroy_or_defer_resource(chunk, rel);
-        submit_with_next(rel);
+        bridge_->advance_present_frame(presents(), released);
+        bridge_->destroy_or_defer_resource(chunk, released);
         storage_relocation_buffers_.erase(
             std::remove(storage_relocation_buffers_.begin(), storage_relocation_buffers_.end(), chunk),
             storage_relocation_buffers_.end());
         note_storage_home_buffer(chunk, false);
+    }
+
+    // Not submit(): the sink can block (live pump backpressure). The packets (evicted homes' destroys,
+    // the new home's create and upload, emptied chunks' destroys) go out at the start of the next
+    // submission, before any command list that binds the home. The queue lock is taken before the
+    // relocation lock is let go: a thread that binds the new entry from now on can only submit after
+    // these packets are queued, and misses queue in the order they changed the cache. The copy into
+    // the queue is then made without holding up the recording threads.
+    {
+        std::lock_guard<std::mutex> queue(next_submission_mutex_);
+        lock.unlock();
+        for (const CommandEncoder* e : {&enc, &writes, &released}) {
+            next_submission_.insert(next_submission_.end(), e->data(), e->data() + e->size());
+        }
     }
 
     *buffer_id = target_buf;
@@ -3654,19 +3666,15 @@ bool Device::storage_homes_unmoved(const std::pair<uint32_t, uint64_t>* homes, s
     }
     // Same LRU bookkeeping as a hit in relocate_storage_buffer (the #663 reuse guard counts it).
     for (size_t i = 0; i < count; ++i) {
-        const auto it = storage_home_index_.find(storage_home_key(homes[i].first, homes[i].second))->second;
-        const uint64_t seq = ++storage_relocation_seq_;
-        auto node = storage_relocation_lru_.extract(it->second.last_used_seq);
-        if (node.empty()) {
-            storage_relocation_lru_.emplace(seq, it->first);
-        } else {
-            node.key() = seq;  // reuse the node: no allocation per touch
-            storage_relocation_lru_.insert(std::move(node));
-        }
-        it->second.last_used_present = present;
-        it->second.last_used_seq = seq;
+        touch_storage_lru(storage_home_index_.find(storage_home_key(homes[i].first, homes[i].second))->second->second,
+                          present);
     }
     return true;
+}
+
+void Device::touch_storage_lru(RelocatedStorage& r, uint64_t present) {
+    storage_relocation_lru_.splice(storage_relocation_lru_.end(), storage_relocation_lru_, r.lru_pos);
+    r.lru_pos->last_used_present = present;
 }
 
 bool Device::relocate_ia_buffer(uint64_t va, uint64_t size, uint32_t* buffer_id, uint64_t* offset) {

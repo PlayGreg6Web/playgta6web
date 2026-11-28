@@ -1313,6 +1313,15 @@ private:
     // relocations_ keys, least recently bound first (under relocation_mutex_): a bind moves its key to
     // the back, so the entry evicted at the cap is the front one (O(1) instead of a scan of the map).
     std::list<RelocatedUniformKey> relocation_lru_;
+    struct RelocatedStorage;
+    // One storage_relocation_lru_ node. It carries what the miss path's reuse scan looks at (the use
+    // present and the entry's fixed home shape), so the scan reads only the list.
+    struct StorageLruNode {
+        RelocatedStorage* entry = nullptr;
+        uint64_t last_used_present = 0;  // present_epoch() at the last bind (reuse guard, #663)
+        uint64_t slot_capacity = 0;      // entry->slot_capacity
+        bool dedicated = false;          // entry->dedicated
+    };
     struct RelocatedStorage {
         uint64_t va = 0;
         uint64_t size = 0;
@@ -1320,8 +1329,7 @@ private:
         uint64_t offset = 0;
         uint64_t slot_capacity = 0;
         uint64_t last_hash = 0;
-        uint64_t last_used_seq = 0;
-        uint64_t last_used_present = 0;  // present_epoch() at the last bind (reuse guard, #663)
+        std::list<StorageLruNode>::iterator lru_pos;  // this entry's node in storage_relocation_lru_
         uint64_t created_epoch = 0;      // relocation_evictions_ when this home took the range
         bool ever_uploaded = false;
         bool dedicated = false;
@@ -1374,10 +1382,12 @@ private:
     std::map<uint32_t, uint32_t> storage_relocation_chunk_live_;  // shared chunk -> live homes; 0 = destroyed
     uint32_t storage_relocation_buffer_ = 0;
     uint64_t storage_relocation_used_ = 0;
-    uint64_t storage_relocation_seq_ = 0;
-    // Least recently used order of storage_relocations_ (last_used_seq -> key) and the bytes of
+    // storage_relocations_ entries, least recently bound first: a bind moves its node to the back (O(1),
+    // no allocation), the miss path's reuse scan and eviction start at the front. And the bytes of
     // their homes (slot capacities).
-    std::map<uint64_t, RelocatedStorageKey> storage_relocation_lru_;
+    std::list<StorageLruNode> storage_relocation_lru_;
+    // A bind of `r` (under storage_relocation_mutex_): its node goes to the back with this present.
+    void touch_storage_lru(RelocatedStorage& r, uint64_t present);
     uint64_t storage_relocation_bytes_ = 0;
     // G66 (#691): uniform / storage relocation homes handed to another range (BridgeOptions::relocation_epoch).
     std::atomic<uint64_t> relocation_evictions_{0};
@@ -1968,6 +1978,9 @@ enum class Work : size_t {
     FlushUniformsSkipped,
     FlushStorageCompared,  // relocated storage ranges looked at / skipped by an indexed flush
     FlushStorageSkipped,
+    // relocate_storage_buffer misses that placed a range, and the LRU nodes their reuse scans looked at.
+    StorageRelocationMisses,
+    StorageReuseScanSteps,
     FlushIaCompared,       // relocated IA (vertex / index) ranges looked at / skipped by an indexed flush
     FlushIaSkipped,
     FlushCrosscheckLate,
