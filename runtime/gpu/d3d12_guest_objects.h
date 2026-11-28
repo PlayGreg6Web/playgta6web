@@ -1472,6 +1472,31 @@ private:
     std::vector<Resource*> flush_buffer_candidates_;
     std::vector<RelocatedUniform*> flush_uniform_candidates_;
     std::vector<RelocatedStorage*> flush_storage_candidates_;
+    // A relocated storage range an indexed flush hashes without storage_relocation_mutex_: taken under
+    // the lock (write marks, cursor), hashed / copied after letting go, applied under it again if the
+    // entry is still the same one (key, address and created_epoch), then encoded outside it.
+    struct StorageHashJob {
+        RelocatedStorage* entry = nullptr;
+        uint64_t va = 0, size = 0;
+        bool dedicated = false;
+        uint64_t created_epoch = 0;
+        uint64_t cpu = 0;
+        uintptr_t taken_host = 0;  // host address the cursor was taken at (0: not mapped in one piece)
+        bool ever_uploaded = false;
+        uint64_t last_hash = 0;
+        // Filled without the lock.
+        uintptr_t host = 0;
+        bool read_ok = false;
+        bool changed = false;
+        uint64_t hash = 0;
+        std::vector<uint8_t> bytes;  // the new bytes (padded to 4) when changed
+        // Filled when applied.
+        bool upload = false;
+        uint32_t buffer_id = 0;
+        uint64_t offset = 0;
+    };
+    std::vector<StorageHashJob> flush_storage_jobs_;  // reused; the first flush_storage_job_count_ are live
+    size_t flush_storage_job_count_ = 0;
     std::vector<RelocatedIa*> flush_ia_candidates_;
     std::vector<uint8_t> flush_bytes_scratch_;
     mutable std::mutex tracked_textures_mutex_;

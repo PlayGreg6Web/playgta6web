@@ -2971,8 +2971,11 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
     }
     // Relocated storage buffers (G51): refresh any relocated range whose guest bytes changed.
     {
-        std::lock_guard<std::mutex> lock(storage_relocation_mutex_);
+        std::unique_lock<std::mutex> lock(storage_relocation_mutex_);
         flush_visit_keys_.clear();
+        flush_storage_job_count_ = 0;
+        // Indexed flushes hash the ranges that may have changed without the lock (StorageHashJob).
+        const bool defer_hashes = indexed && !crosscheck;
         if (indexed) {
             // As the uniform ranges above: the entries a take reported (or whose take failed) are
             // visited; a primed entry no take named is unchanged since its last comparison.
@@ -2996,6 +2999,29 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
             crosscheck_storage_.clear();
         }
         uint64_t storage_compared = 0, storage_skipped = 0;
+        // Indexed flushes: (re-)index the range at the host address it was looked at (primed when this
+        // flush's take covered it), or drop it from the index when it is not mapped in one piece.
+        const auto reindex_storage = [&](RelocatedStorage& r, uintptr_t seen_host, bool index_skip, bool uploaded) {
+            if (!indexed) {
+                return;
+            }
+            if (index_skip && uploaded) {
+                crosscheck_storage_.insert(&r);
+            }
+            if (seen_host != 0) {
+                const uintptr_t hi = seen_host + static_cast<uintptr_t>(r.size);
+                storage_page_index_.add(&r, seen_host, hi);
+                r.index_primed = r.ever_uploaded && ranges_cover(flush_taken_ok_, seen_host, hi);
+            } else {
+                storage_page_index_.remove(&r);
+                r.index_primed = false;
+            }
+            if (r.index_primed) {
+                storage_unprimed_.erase(&r);
+            } else {
+                storage_unprimed_.insert(&r);
+            }
+        };
         auto visit_storage = [&](RelocatedStorage& r) {
             bool index_skip = false;
             if (indexed && r.index_primed && r.ever_uploaded && r.visit_seq != seq) {
@@ -3008,31 +3034,9 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
             if (index_skip && !crosscheck) {
                 return;
             }
-            // Indexed flushes: (re-)index the range at the host address it was looked at (primed when
-            // this flush's take covered it), or drop it from the index when it is not mapped in one piece.
             uintptr_t seen_host = 0;
             bool uploaded = false;
-            const auto reindex = [&]() {
-                if (!indexed) {
-                    return;
-                }
-                if (index_skip && uploaded) {
-                    crosscheck_storage_.insert(&r);
-                }
-                if (seen_host != 0) {
-                    const uintptr_t hi = seen_host + static_cast<uintptr_t>(r.size);
-                    storage_page_index_.add(&r, seen_host, hi);
-                    r.index_primed = r.ever_uploaded && ranges_cover(flush_taken_ok_, seen_host, hi);
-                } else {
-                    storage_page_index_.remove(&r);
-                    r.index_primed = false;
-                }
-                if (r.index_primed) {
-                    storage_unprimed_.erase(&r);
-                } else {
-                    storage_unprimed_.insert(&r);
-                }
-            };
+            const auto reindex = [&]() { reindex_storage(r, seen_host, index_skip, uploaded); };
             const uint64_t write_len = align_up(r.size, 4u);
             const uint64_t cpu = cpu_address_for_gpu(r.va);
             const bool marks_vouch = r.ever_uploaded && !r.hash_next_flush;  // hashed below otherwise
@@ -3046,6 +3050,7 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
             uint64_t hash = 0;
             bool mapped = false;
             bool unchanged = false;
+            bool defer = false;
             {
                 const com::GuestRangeView view(cpu, static_cast<size_t>(r.size));  // holds the arena lock
                 if (view.data() != nullptr) {
@@ -3053,6 +3058,8 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
                     seen_host = reinterpret_cast<uintptr_t>(view.data());
                     if (native_unwritten(r.write_cursor, r.write_primed, view.data(), r.size) && marks_vouch) {
                         unchanged = true;  // no page written since the last hash: same bytes
+                    } else if (defer_hashes) {
+                        defer = true;
                     } else {
                         hash = content_hash(view.data(), static_cast<size_t>(r.size));
                         if (r.ever_uploaded && hash == r.last_hash) {
@@ -3065,6 +3072,23 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
             }
             if (unchanged) {
                 reindex();
+                return;
+            }
+            if (defer || (!mapped && defer_hashes)) {
+                if (flush_storage_job_count_ == flush_storage_jobs_.size()) {
+                    flush_storage_jobs_.emplace_back();
+                }
+                StorageHashJob& job = flush_storage_jobs_[flush_storage_job_count_++];
+                job.entry = &r;
+                job.va = r.va;
+                job.size = r.size;
+                job.dedicated = r.dedicated;
+                job.created_epoch = r.created_epoch;
+                job.cpu = cpu;
+                job.taken_host = seen_host;
+                job.ever_uploaded = r.ever_uploaded;
+                job.last_hash = r.last_hash;
+                job.upload = false;
                 return;
             }
             if (!mapped) {
@@ -3113,6 +3137,64 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
                 visit_storage(*r);
             }
             storage_skipped += static_cast<uint64_t>(storage_relocations_.size() - flush_storage_candidates_.size());
+            if (flush_storage_job_count_ != 0) {
+                // The hashes (and copies of changed ranges) run without the lock, so recording threads
+                // binding storage ranges and relocation misses are not held behind them. The write marks
+                // and cursors were taken above, before the bytes are read, as on the locked path: a write
+                // racing the hash is reported to the next flush.
+                lock.unlock();
+                for (size_t i = 0; i < flush_storage_job_count_; ++i) {
+                    StorageHashJob& job = flush_storage_jobs_[i];
+                    job.host = 0;
+                    job.read_ok = false;
+                    job.changed = false;
+                    {
+                        const com::GuestRangeView view(job.cpu, static_cast<size_t>(job.size));
+                        if (view.data() != nullptr) {
+                            job.host = reinterpret_cast<uintptr_t>(view.data());
+                            job.read_ok = true;
+                            job.hash = content_hash(view.data(), static_cast<size_t>(job.size));
+                            job.changed = !job.ever_uploaded || job.hash != job.last_hash;
+                            if (job.changed) {
+                                job.bytes.assign(view.data(), view.data() + job.size);
+                            }
+                        }
+                    }
+                    if (job.host == 0) {
+                        job.bytes.resize(static_cast<size_t>(job.size));
+                        job.read_ok = read_guest_best_effort(job.cpu, job.bytes.data(), job.bytes.size());
+                        if (job.read_ok) {
+                            job.hash = content_hash(job.bytes.data(), job.bytes.size());
+                            job.changed = !job.ever_uploaded || job.hash != job.last_hash;
+                        }
+                    }
+                    if (job.changed) {
+                        job.bytes.resize(static_cast<size_t>(align_up(job.size, 4u)), 0);
+                    }
+                }
+                lock.lock();
+                for (size_t i = 0; i < flush_storage_job_count_; ++i) {
+                    StorageHashJob& job = flush_storage_jobs_[i];
+                    // Evicted (or evicted and placed again) meanwhile: the new entry is unprimed.
+                    const auto it = storage_relocations_.find(RelocatedStorageKey{job.va, job.size, job.dedicated});
+                    if (it == storage_relocations_.end() || &it->second != job.entry ||
+                        it->second.created_epoch != job.created_epoch) {
+                        continue;
+                    }
+                    RelocatedStorage& r = it->second;
+                    if (job.host != job.taken_host) {
+                        r.write_primed = false;  // remapped since the cursor was taken: take it again
+                    }
+                    if (job.changed) {
+                        r.last_hash = job.hash;
+                        r.ever_uploaded = true;
+                        job.upload = true;
+                        job.buffer_id = r.buffer_id;
+                        job.offset = r.offset;
+                    }
+                    reindex_storage(r, job.read_ok ? job.host : 0, false, job.upload);
+                }
+            }
         } else {
             for (auto& [key, r] : storage_relocations_) {
                 visit_storage(r);
@@ -3121,6 +3203,24 @@ void Device::flush_cpu_buffers(CommandEncoder& encoder) {
         if (indexed) {
             count_work(Work::FlushStorageCompared, storage_compared);
             count_work(Work::FlushStorageSkipped, storage_skipped);
+        }
+    }
+    // The changed ranges hashed without the lock. A home handed to another range after this point is
+    // the same case as on the locked path (whose packets were encoded but not yet submitted either).
+    for (size_t i = 0; i < flush_storage_job_count_; ++i) {
+        StorageHashJob& job = flush_storage_jobs_[i];
+        if (job.upload) {
+            const uint64_t write_len = job.bytes.size();
+            for (uint64_t off = 0; off < write_len; off += kMaxWriteChunk) {
+                const uint64_t n = std::min<uint64_t>(kMaxWriteChunk, write_len - off);
+                encoder.write_buffer(job.buffer_id, static_cast<uint32_t>(job.offset + off), job.bytes.data() + off,
+                                     static_cast<uint32_t>(n));
+            }
+            count_work(Work::BufferUploads);
+            note_upload(write_len);
+        }
+        if (job.bytes.capacity() > (size_t{1} << 20)) {
+            std::vector<uint8_t>().swap(job.bytes);  // the slots are reused: do not keep large copies
         }
     }
     // Relocated index / vertex buffers (G58): re-upload ring buffers the title wrote since.
