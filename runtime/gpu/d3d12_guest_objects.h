@@ -86,6 +86,7 @@
 #include "gpu/log_rate_limiter.h"
 #include "gpu/pso_cache.h"
 #include "gpu/shader_pack_index.h"
+#include "gpu/storage_reuse_lru.h"
 #include "gpu/small_texture_pool.h"
 #include "gpu/stage_reflection.h"
 #include "gpu/state_bridge.h"
@@ -992,6 +993,8 @@ public:
     static constexpr size_t kStorageRelocationSoftEntries = 512;
     static constexpr size_t kStorageRelocationHardEntries = 65536;
     static constexpr uint64_t kStorageRelocationHardBytes = uint64_t{1} << 30;
+    // Settled homes a miss looks at for reuse, oldest first, before the least recently used one is dropped.
+    static constexpr size_t kStorageReuseScan = 1024;
     uint64_t relocated_storage_bytes() const;
     // Shared (non-dedicated) 4 MiB chunks allocated for small storage relocations (test hook, #2093).
     size_t relocated_storage_chunk_count() const;
@@ -1314,14 +1317,7 @@ private:
     // the back, so the entry evicted at the cap is the front one (O(1) instead of a scan of the map).
     std::list<RelocatedUniformKey> relocation_lru_;
     struct RelocatedStorage;
-    // One storage_relocation_lru_ node. It carries what the miss path's reuse scan looks at (the use
-    // present and the entry's fixed home shape), so the scan reads only the list.
-    struct StorageLruNode {
-        RelocatedStorage* entry = nullptr;
-        uint64_t last_used_present = 0;  // present_epoch() at the last bind (reuse guard, #663)
-        uint64_t slot_capacity = 0;      // entry->slot_capacity
-        bool dedicated = false;          // entry->dedicated
-    };
+    using StorageLru = StorageReuseLru<RelocatedStorage>;
     struct RelocatedStorage {
         uint64_t va = 0;
         uint64_t size = 0;
@@ -1329,7 +1325,7 @@ private:
         uint64_t offset = 0;
         uint64_t slot_capacity = 0;
         uint64_t last_hash = 0;
-        std::list<StorageLruNode>::iterator lru_pos;  // this entry's node in storage_relocation_lru_
+        StorageLru::Node lru_node;  // in storage_relocation_lru_ (bind present, home shape)
         uint64_t created_epoch = 0;      // relocation_evictions_ when this home took the range
         bool ever_uploaded = false;
         bool dedicated = false;
@@ -1383,9 +1379,9 @@ private:
     uint32_t storage_relocation_buffer_ = 0;
     uint64_t storage_relocation_used_ = 0;
     // storage_relocations_ entries, least recently bound first: a bind moves its node to the back (O(1),
-    // no allocation), the miss path's reuse scan and eviction start at the front. And the bytes of
-    // their homes (slot capacities).
-    std::list<StorageLruNode> storage_relocation_lru_;
+    // no allocation), eviction takes the front, and the miss path's reuse lookup is indexed (the same
+    // home as a scan of the first kStorageReuseScan nodes). And the bytes of their homes (slot capacities).
+    StorageLru storage_relocation_lru_{kStorageReuseScan};
     // A bind of `r` (under storage_relocation_mutex_): its node goes to the back with this present.
     void touch_storage_lru(RelocatedStorage& r, uint64_t present);
     uint64_t storage_relocation_bytes_ = 0;
@@ -1978,7 +1974,8 @@ enum class Work : size_t {
     FlushUniformsSkipped,
     FlushStorageCompared,  // relocated storage ranges looked at / skipped by an indexed flush
     FlushStorageSkipped,
-    // relocate_storage_buffer misses that placed a range, and the LRU nodes their reuse scans looked at.
+    // relocate_storage_buffer misses that placed a range, and the present groups / capacity buckets / LRU
+    // nodes their indexed reuse lookups looked at (gpu/storage_reuse_lru.h).
     StorageRelocationMisses,
     StorageReuseScanSteps,
     FlushIaCompared,       // relocated IA (vertex / index) ranges looked at / skipped by an indexed flush
