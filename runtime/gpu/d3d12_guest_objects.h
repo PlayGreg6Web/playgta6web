@@ -1477,6 +1477,10 @@ private:
         uint64_t va = 0;
         size_t bytes = 0;
         uint64_t hash = 0;
+        // Write tracking position taken before `hash` was last computed or confirmed: a bind that finds
+        // no page written since then skips the surface hash. primed = that take could tell.
+        os::WriteCursor cursor{};
+        bool cursor_primed = false;
     };
     std::unordered_map<uint32_t, ReadbackOwned> readback_owned_;  // under tracked_textures_mutex_
     std::unordered_set<uint32_t> conversion_skipped_;  // under tracked_textures_mutex_: reported once
@@ -1875,6 +1879,8 @@ enum class Work : size_t {
     TextureSyncViewSkips,    // sync skipped: view-backed range, no page written since the last full check
     TextureSyncViewTracked,  // sync of a wholly view-backed range (skipped or not)
     TextureSyncUntracked,    // sync of a range with a host pointer but no view coverage
+    TextureSyncOwnedChecks,  // binds of a texture whose texels our read-back re-tile wrote
+    TextureSyncOwnedHashSkips,  // ... where no page was written since the last check (no surface hash)
     BufferUploads,
     CopiesSkipped,
     // Texture-to-texture copies skipped, by reason (each is also counted in CopiesSkipped).
