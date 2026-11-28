@@ -1094,6 +1094,14 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
     // their contents are unchanged or skipped by write-mark tracking.
     texture_budget().touch_texture(resource_id, present_epoch());
     TrackedTexture tt{};
+    // Fast path for the common case, a bound texture whose last full check is still current: its watched
+    // host range and cursor are kept in the entry, so a repeat bind only asks the write tracking whether a
+    // page was written since (no copy of the entry, no format / layout / host-range work). Taken with a
+    // copy of the cursor, which is kept only when nothing was written; otherwise the full path below runs
+    // from the old position and sees the same pages.
+    const uint8_t* fast_host = nullptr;
+    uint64_t fast_size = 0;
+    os::WriteCursor fast_cursor{};
     {
         ReadbackOwned owned{};
         bool is_owned = false;
@@ -1133,7 +1141,19 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
                 return false;  // already synced into an earlier part of this submission
             }
             it->second.synced_submission = t_submission;
-            tt = it->second;
+            const TrackedTexture& cur = it->second;
+            const uint32_t cap_now = texture_budget().current_cap();
+            const bool unsettled =
+                cur.has_create && cur.layout >= gfx10::kConsoleLinearLayout &&
+                cap_floor_for(cur.width, cur.height, std::max(cur.mip_levels, 1u), cap_now) != cur.host_floor;
+            if (cur.view_checked && cur.view_host != nullptr && cur.view_size != 0 && cur.view_checked_cap == cap_now &&
+                !unsettled && !va_watch::active()) {
+                fast_host = cur.view_host;
+                fast_size = cur.view_size;
+                fast_cursor = cur.view_cursor;
+            } else {
+                tt = it->second;
+            }
         } else {
             bridge::TextureInfo info{};
             if (!bridge_->texture_info(resource_id, &info) || info.swapchain || info.gpu_va == 0 ||
@@ -1156,6 +1176,28 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
             tt.synced_submission = t_submission;
             tracked_textures_[resource_id] = tt;
         }
+    }
+    if (fast_host != nullptr) {
+        thread_local std::vector<uint64_t> fast_pages;
+        fast_pages.clear();
+        fast_cursor.peek_watch = true;  // as the full path's take
+        const bool tracked = os::take_written_pages(fast_host, fast_size, &fast_cursor, &fast_pages);
+        std::lock_guard<std::mutex> lock(tracked_textures_mutex_);
+        const auto it = tracked_textures_.find(resource_id);
+        if (it == tracked_textures_.end()) {
+            return false;
+        }
+        TrackedTexture& cur = it->second;
+        // Still the range and check the cursor was copied from (another thread's full check may have
+        // cleared it meanwhile: then it is not skipped on this cursor).
+        if (tracked && fast_pages.empty() && cur.view_checked && cur.view_host == fast_host && cur.view_size == fast_size &&
+            cur.view_checked_cap == texture_budget().current_cap()) {
+            cur.view_cursor = fast_cursor;
+            count_work(Work::TextureSyncViewTracked);
+            count_work(Work::TextureSyncViewSkips);
+            return false;
+        }
+        tt = cur;  // written (or could not tell): the full path, from the entry's own cursor
     }
     if (tt.gpu_va == 0 || tt.width == 0 || tt.height == 0 || tt.sample_count > 1) {
         return false;
@@ -1233,8 +1275,10 @@ bool Device::sync_bound_texture_memory(uint32_t resource_id, CommandEncoder& enc
     const uint32_t blocks_y = (h + l.block_height - 1u) / l.block_height;
     const uint64_t tight_row_bytes = uint64_t{blocks_x} * l.block_bytes;
     const uint64_t tight_mip0_bytes = tight_row_bytes * blocks_y * d;
-    va_watch::touch("upload (bound texture memory)", tt.gpu_va, tight_mip0_bytes * layers,
-                    "texture id " + std::to_string(resource_id) + ", DXGI format " + std::to_string(tt.dxgi_format));
+    if (va_watch::active()) {  // (the detail string is built on every bind otherwise)
+        va_watch::touch("upload (bound texture memory)", tt.gpu_va, tight_mip0_bytes * layers,
+                        "texture id " + std::to_string(resource_id) + ", DXGI format " + std::to_string(tt.dxgi_format));
+    }
     constexpr uint64_t kMaxSyncTextureBytes = 64u << 20;
     if (tight_mip0_bytes == 0 || align_up(tight_row_bytes, 256u) * blocks_y * d > kMaxSyncTextureBytes) {
         return false;
