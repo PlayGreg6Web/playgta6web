@@ -25,6 +25,19 @@ void check_impl(bool cond, const char* expr, int line) {
 using namespace playgta6::gpu::native_exec;
 using namespace std::chrono_literals;
 
+// Waits until `cond` holds (10 s at most). The tests used fixed sleeps for "the other thread got
+// there by now", which fails on an oversubscribed CI runner where a thread can wait longer than
+// that for its first time slice.
+template <class F>
+bool wait_until(F cond) {
+    const auto deadline = std::chrono::steady_clock::now() + 10s;
+    while (!cond()) {
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+        std::this_thread::sleep_for(1ms);
+    }
+    return true;
+}
+
 // State shared with the test body (the executor itself lives on the pump thread).
 struct Shared {
     std::mutex m;
@@ -103,8 +116,9 @@ void test_backpressure_blocks_and_counts() {
             ++accepted;
         }
     });
-    std::this_thread::sleep_for(150ms);
     // One batch is inside the stuck execute(), 4 are queued: the producer must be stopped there.
+    CHECK(wait_until([&] { return accepted.load() == 5 && pump.stats().blocked_now == 1; }));
+    std::this_thread::sleep_for(120ms);  // (still stopped, and the in-flight times below grow past 100 ms)
     CHECK(accepted.load() == 5);
     CHECK(pump.stats().max_queue_depth == 4);
     // The in-flight snapshot shows the never-ending wait and batch (the totals do not yet).
@@ -158,14 +172,14 @@ void test_byte_bound_and_oversized_batch() {
     Pump pump(opt);
     CHECK(start(pump, sh));
     submit_byte(pump, 0, 10);  // taken by the stuck executor
-    std::this_thread::sleep_for(50ms);
+    CHECK(wait_until([&] { return pump.stats().queued_now == 0; }));
     submit_byte(pump, 1, 5000);  // oversized: admitted into an empty queue, never deadlocks
     std::atomic<bool> done{false};
     std::thread producer([&] {
         submit_byte(pump, 2, 10);  // 5000 queued already: waits
         done = true;
     });
-    std::this_thread::sleep_for(100ms);
+    CHECK(wait_until([&] { return pump.stats().blocked_now == 1; }));
     CHECK(!done.load());
     sh.gate = true;
     producer.join();

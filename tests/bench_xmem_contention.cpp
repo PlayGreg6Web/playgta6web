@@ -38,9 +38,10 @@ constexpr size_t kPagesPerThread = 4;
 
 std::atomic<bool> g_stop{false};
 std::atomic<int> g_failures{0};
+std::atomic<int> g_started{0};  // threads that reached their loop
 
 struct Result {
-    uint64_t iterations = 0;
+    std::atomic<uint64_t> iterations{0};  // (published as it goes: the smoke pass waits for progress)
 };
 
 void worker(uint64_t base_va, const uint64_t* pfns, int seed, Result* out) {
@@ -50,6 +51,7 @@ void worker(uint64_t base_va, const uint64_t* pfns, int seed, Result* out) {
     WriteCursor cursor;
     std::vector<uint64_t> pages;
     take_written_pages(p, len, &cursor, &pages);  // (initial: everything new)
+    g_started.fetch_add(1);
     uint64_t it = 0;
     while (!g_stop.load(std::memory_order_relaxed)) {
         const size_t i = static_cast<size_t>(it % kPagesPerThread);
@@ -80,8 +82,8 @@ void worker(uint64_t base_va, const uint64_t* pfns, int seed, Result* out) {
             return;
         }
         ++it;
+        out->iterations.store(it, std::memory_order_relaxed);
     }
-    out->iterations = it;
 }
 
 // ns per take_written_pages call, `takes` resource-sized takes over `res` resources of `res_len`
@@ -203,10 +205,10 @@ int main(int argc, char** argv) {
                     harvest_ns(arena->translate(base), 1, total * kXMemPageSize64K, rounds * 16, "range"));
     }
 
-    const uint64_t faults0 = shared_view_write_faults();
     std::vector<Result> results(static_cast<size_t>(threads));
     std::atomic<uint64_t> render_takes{0};
     std::vector<std::thread> pool;
+    const auto created = Clock::now();
     for (int w = 0; w < threads; ++w) {
         pool.emplace_back(worker, base + uint64_t{kPagesPerThread} * w * kXMemPageSize64K,
                           &pfns[kPagesPerThread * static_cast<size_t>(w)], w * 31 + 7, &results[static_cast<size_t>(w)]);
@@ -215,14 +217,56 @@ int main(int argc, char** argv) {
         WriteCursor cursor;
         std::vector<uint64_t> pages;
         const uint8_t* p = arena->translate(base);
+        g_started.fetch_add(1);
         while (!g_stop.load(std::memory_order_relaxed)) {
             pages.clear();
             take_written_pages(p, uint64_t{total} * kXMemPageSize64K, &cursor, &pages);
             render_takes.fetch_add(1, std::memory_order_relaxed);
         }
     });
+    // The window starts once every thread runs. A fixed 300 ms window from thread creation made the
+    // smoke pass measure the scheduler, not the tracker: on an oversubscribed runner (CTest --parallel
+    // on 4 vCPUs, Windows Server's long fixed quanta) new threads can wait longer than that for their
+    // first time slice, and a lock holder preempted mid-take stalls the others for a whole quantum,
+    // so it ended with 0 iterations, 0 takes and 0 faults. The smoke pass therefore runs at least
+    // 300 ms and until every worker has done kMinIterations (two remaps each) and the render thread
+    // kMinIterations takes, failing only if that takes longer than kDeadline.
+    constexpr uint64_t kMinIterations = 128;
+    constexpr auto kDeadline = std::chrono::seconds(60);
+    const int all = threads + 1;
+    while (g_started.load() < all && Clock::now() - created < kDeadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
     const auto t0 = Clock::now();
-    std::this_thread::sleep_for(std::chrono::milliseconds(full ? 3000 : 300));
+    // (Counted from here: a thread that started early has a head start the rates leave out.)
+    const uint64_t faults0 = shared_view_write_faults();
+    const uint64_t takes0 = render_takes.load();
+    uint64_t iters0 = 0;
+    for (const Result& r : results) {
+        iters0 += r.iterations.load();
+    }
+    const double start_ms = std::chrono::duration<double, std::milli>(t0 - created).count();
+    auto progressed = [&] {
+        if (render_takes.load(std::memory_order_relaxed) < kMinIterations) {
+            return false;
+        }
+        for (const Result& r : results) {
+            if (r.iterations.load(std::memory_order_relaxed) < kMinIterations) {
+                return false;
+            }
+        }
+        return true;
+    };
+    const auto window = std::chrono::milliseconds(full ? 3000 : 300);
+    bool timed_out = false;
+    std::this_thread::sleep_for(window);
+    while (!full && !progressed()) {
+        if (Clock::now() - created >= kDeadline) {
+            timed_out = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
     g_stop.store(true);
     for (auto& t : pool) {
         t.join();
@@ -230,17 +274,29 @@ int main(int argc, char** argv) {
     render.join();
     const double secs = std::chrono::duration<double>(Clock::now() - t0).count();
     uint64_t iters = 0;
+    uint64_t slowest = ~uint64_t{0};
     for (const Result& r : results) {
-        iters += r.iterations;
+        iters += r.iterations.load();  // (minus iters0 below)
+        slowest = std::min(slowest, r.iterations.load());
     }
+    iters -= iters0;
     std::printf("%d thread(s) + render taker, %.2f s: %.0f write/take iterations/s (%.0f per thread), "
                 "%.0f render takes/s, %llu faults\n",
-                threads, secs, iters / secs, iters / secs / threads, render_takes.load() / secs,
+                threads, secs, iters / secs, iters / secs / threads, (render_takes.load() - takes0) / secs,
                 static_cast<unsigned long long>(shared_view_write_faults() - faults0));
+    std::printf("threads running %.1f ms after creation; slowest worker %llu iterations\n", start_ms,
+                static_cast<unsigned long long>(slowest));
+    if (timed_out) {
+        std::fprintf(stderr, "FAIL: no progress within %lld s (%d/%d threads started, slowest worker %llu iterations, "
+                     "%llu render takes)\n",
+                     static_cast<long long>(kDeadline.count()), g_started.load(), all,
+                     static_cast<unsigned long long>(slowest), static_cast<unsigned long long>(render_takes.load()));
+        g_failures.fetch_add(1);
+    }
     pg6_xbox_XMemMapPhysicalPagesScatter(vas.data(), total, nullptr);
     pg6_xbox_XMemFreePhysicalPages(total, pfns.data());
     xmem_virtual_free(res);
-    if (g_failures.load() != 0 || iters == 0) {
+    if (g_failures.load() != 0 || slowest == 0 || render_takes.load() == 0) {
         std::fprintf(stderr, "bench_xmem_contention: FAILED\n");
         return 1;
     }
