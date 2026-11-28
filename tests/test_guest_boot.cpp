@@ -1498,6 +1498,9 @@ std::atomic<bool> g_hook_exit_called{false};
 void hook_exit_park() {
     g_hook_lines = tap_snapshot();
     g_hook_exit_called = true;
+    // Releases the boot thread's wait in the scenario (it polls this flag; on Windows each 1 ms sleep
+    // lasts ~15 ms, so waiting out the 5000-iteration cap takes over a minute per scenario).
+    g_off_thread_reported = true;
     for (;;) {
         std::this_thread::sleep_for(std::chrono::hours(1));
     }

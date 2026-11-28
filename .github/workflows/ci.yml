@@ -82,10 +82,12 @@ jobs:
           key: fc-dawn-7435fd87c506-dxc-1.9.2609-${{ github.event.repository.name }}
       - name: Configure (PLAYGTA6_NATIVE_EXECUTOR=ON)
         run: cmake -S runtime -B build-native-exec -DCMAKE_BUILD_TYPE=Release -DPLAYGTA6_NATIVE_EXECUTOR=ON "-DFETCHCONTENT_BASE_DIR=${{ github.workspace }}/.fc-cache"
-      - name: Build boot harness, executor and model tests
-        run: cmake --build build-native-exec --config Release --parallel --target playgta6_boot pg6_native_exec gen_native_exec_trace test_native_executor test_native_exec_model test_native_exec_reflection test_native_exec_quarantine
-      - name: Run GPU-free tests (GPU tests skip without an adapter)
-        run: ctest --test-dir build-native-exec -C Release --output-on-failure -R "test_native_exec"
+      - name: Build everything (boot harness, executor, and all runtime unit tests)
+        run: cmake --build build-native-exec --config Release --parallel
+      # The Linux job skips every Windows-only branch (lazy commit, write tracking, the D3D12 export
+      # surface, minidumps); the full suite runs here against the same build. GPU tests skip without an adapter.
+      - name: Run all runtime unit tests (Windows paths) and executor tests
+        run: ctest --test-dir build-native-exec -C Release --output-on-failure --parallel 4 --timeout 300
       - name: E2E smoke on the WARP software adapter (replay, digests, PNG dump, native_replay_compare --self-check)
         run: python tests/native_exec_warp_smoke.py --exec build-native-exec/Release/pg6_native_exec.exe --gen build-native-exec/Release/gen_native_exec_trace.exe
 
