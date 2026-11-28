@@ -484,16 +484,16 @@ else()
         target_include_directories(test_minidump_fault PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
         add_test(NAME playgta6_minidump_fault_tests COMMAND test_minidump_fault)
         set_tests_properties(playgta6_minidump_fault_tests PROPERTIES
-            ENVIRONMENT "PG6_MINIDUMP_STACK_PY=${CMAKE_CURRENT_SOURCE_DIR}/../tools/minidump_stack.py")
+            ENVIRONMENT "PG6_MINIDUMP_STACK_PY=${CMAKE_CURRENT_SOURCE_DIR}/../tools/minidump_stack.py;PG6_MINIDUMP_NO_CDB=1")
         add_test(NAME playgta6_minidump_guest_fault_tests COMMAND test_minidump_fault --guest)
         set_tests_properties(playgta6_minidump_guest_fault_tests PROPERTIES
-            ENVIRONMENT "PG6_MINIDUMP_STACK_PY=${CMAKE_CURRENT_SOURCE_DIR}/../tools/minidump_stack.py")
+            ENVIRONMENT "PG6_MINIDUMP_STACK_PY=${CMAKE_CURRENT_SOURCE_DIR}/../tools/minidump_stack.py;PG6_MINIDUMP_NO_CDB=1")
         # A thread holding the process heap lock must not freeze the dump (#663).
         add_test(NAME playgta6_minidump_locked_heap_tests COMMAND test_minidump_fault --locked)
         # Watchdog path: every thread's stack printed and an all-thread dump.
         add_test(NAME playgta6_minidump_hang_tests COMMAND test_minidump_fault --hang)
         set_tests_properties(playgta6_minidump_hang_tests PROPERTIES
-            ENVIRONMENT "PG6_MINIDUMP_STACK_PY=${CMAKE_CURRENT_SOURCE_DIR}/../tools/minidump_stack.py")
+            ENVIRONMENT "PG6_MINIDUMP_STACK_PY=${CMAKE_CURRENT_SOURCE_DIR}/../tools/minidump_stack.py;PG6_MINIDUMP_NO_CDB=1")
 
         # End to end: host fault, watchdog hang and stuck report path (backstop) each leave a
         # parseable non-empty minidump within a time bound.
@@ -501,13 +501,16 @@ else()
         target_include_directories(test_minidump_e2e PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
         add_test(NAME playgta6_minidump_e2e_tests COMMAND test_minidump_e2e)
         set_tests_properties(playgta6_minidump_e2e_tests PROPERTIES
-            ENVIRONMENT "PG6_MINIDUMP_STACK_PY=${CMAKE_CURRENT_SOURCE_DIR}/../tools/minidump_stack.py")
+            ENVIRONMENT "PG6_MINIDUMP_STACK_PY=${CMAKE_CURRENT_SOURCE_DIR}/../tools/minidump_stack.py;PG6_MINIDUMP_NO_CDB=1")
 
         # The real playgta6_boot watchdog path (stall seam --test-stall, synthetic image): stacks, dump, report.
         add_executable(test_boot_watchdog_e2e ../tests/test_boot_watchdog_e2e.cpp)
         target_include_directories(test_boot_watchdog_e2e PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
         add_test(NAME playgta6_boot_watchdog_e2e_tests COMMAND test_boot_watchdog_e2e $<TARGET_FILE:playgta6_boot>
                  ${CMAKE_CURRENT_SOURCE_DIR}/../tools/minidump_stack.py)
+        # The tests check minidump_stack.py's own output format; a cdb on the machine (CI runners have one)
+        # would replace it with cdb's, so pin the built-in parser.
+        set_tests_properties(playgta6_boot_watchdog_e2e_tests PROPERTIES ENVIRONMENT PG6_MINIDUMP_NO_CDB=1)
     endif()
 
     add_executable(test_host_marshallers ../tests/test_host_marshallers.cpp)
