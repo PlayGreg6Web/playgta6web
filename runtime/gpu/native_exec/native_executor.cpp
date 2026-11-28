@@ -1045,6 +1045,9 @@ struct NativeExecutor::Impl {
     uint64_t max_uniform_binding = 65536, max_storage_binding = 134217728;
     uint16_t cur_opcode = 0;              // the packet in flight, for device_error_kinds
     std::atomic<uint64_t> error_scoped_total{0};  // scoped errors recorded (drives the auto mode's cut-off)
+    // Device errors nothing attributed (uncaptured on this thread, or caught by a packet scope) and the present
+    // of the latest one: they arm the auto scopes for a window (error_scope_active).
+    uint64_t unattributed_errors = 0, last_unattributed_present = 0;
 
     std::string render_pipeline_ctx(uint32_t id) const {
         auto it = render_pipelines.find(id);
@@ -1456,6 +1459,8 @@ struct NativeExecutor::Impl {
                         return;
                     }
                     ++self->stats.device_errors;
+                    ++self->unattributed_errors;
+                    self->last_unattributed_present = self->stats.present_packets;
                     self->stats.last_device_error = to_string(msg);
                     self->device_error_kinds.record(self->cur_opcode, self->stats.last_device_error);
                     if (self->stats.device_error_log.size() < 20) self->stats.device_error_log.push_back(to_string(msg));
@@ -3802,7 +3807,8 @@ struct NativeExecutor::Impl {
         const uint64_t t0 = now_ns();
         bool r;
         cur_opcode = p.opcode;
-        const bool diag_scopes = error_scope_active(options.gpu_error_scopes, stats.device_errors, error_scoped_total.load());
+        const bool diag_scopes = error_scope_active(options.gpu_error_scopes, unattributed_errors, last_unattributed_present,
+                                                    stats.present_packets, error_scoped_total.load());
         if (options.gpu_validation || diag_scopes) {
             validation_cur_packet = validation_packet_index++;
             validation_cur_opcode = p.opcode;
@@ -3839,6 +3845,15 @@ struct NativeExecutor::Impl {
                     wgpu::CallbackMode::AllowSpontaneous,
                     [](wgpu::PopErrorScopeStatus, wgpu::ErrorType type, wgpu::StringView msg, Ctx* c) {
                         if (type != wgpu::ErrorType::NoError && type != wgpu::ErrorType::Unknown) {
+                            // Counted as the uncaptured callback would have (the scope swallowed it), and it
+                            // keeps the auto window open while the error recurs.
+                            Impl* self = c->self;
+                            ++self->stats.device_errors;
+                            ++self->unattributed_errors;
+                            self->last_unattributed_present = self->stats.present_packets;
+                            self->stats.last_device_error = to_string(msg);
+                            self->device_error_kinds.record(c->opcode, self->stats.last_device_error);
+                            if (self->stats.device_error_log.size() < 20) self->stats.device_error_log.push_back(self->stats.last_device_error);
                             if (c->validation) c->self->record_validation(c->kind.scope_kind, to_string(msg), c->packet, c->opcode);
                             if (c->diag) {
                                 c->self->error_scope_log.record(c->kind.diag_kind, to_string(msg), error_scope_phase(c->opcode),
