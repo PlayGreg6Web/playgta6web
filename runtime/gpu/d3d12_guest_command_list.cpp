@@ -116,6 +116,8 @@ const char* work_name(Work w) {
     case Work::FlushUniformsSkipped: return "flush_uniforms_skipped";
     case Work::FlushStorageCompared: return "flush_storage_compared";
     case Work::FlushStorageSkipped: return "flush_storage_skipped";
+    case Work::StorageRelocationMisses: return "storage_relocation_misses";
+    case Work::StorageReuseScanSteps: return "storage_reuse_scan_steps";
     case Work::FlushIaCompared: return "flush_ia_compared";
     case Work::FlushIaSkipped: return "flush_ia_skipped";
     case Work::FlushCrosscheckLate: return "flush_crosscheck_late";
